@@ -100,6 +100,15 @@ typedef bool (*SlippiReadDiscFileFn)(void *ctx,
                                      uintptr_t *out_len);
 
 /**
+ * Adapter and slot settings for one local player, passed inside `SlippiInputSuggestionsGameConfig`.
+ */
+typedef struct SlippiInputSuggestionsLocalPlayerConfig {
+  uint8_t player_idx;
+  uint8_t source_port;
+  bool source_is_adapter;
+} SlippiInputSuggestionsLocalPlayerConfig;
+
+/**
  * Settings for a game, passed when it starts.
  */
 typedef struct SlippiInputSuggestionsGameConfig {
@@ -107,8 +116,8 @@ typedef struct SlippiInputSuggestionsGameConfig {
   uint8_t local_player_idx;
   uint8_t remote_player_count;
   uint8_t delay;
-  uint8_t source_port;
-  bool source_is_adapter;
+  uint8_t local_player_count;
+  struct SlippiInputSuggestionsLocalPlayerConfig local_players[4];
 } SlippiInputSuggestionsGameConfig;
 
 /**
@@ -116,6 +125,7 @@ typedef struct SlippiInputSuggestionsGameConfig {
  */
 typedef struct SlippiInputSuggestion {
   bool is_valid;
+  uint8_t player_idx;
   int32_t target_frame;
   uint32_t seq;
   uint8_t pad[8];
@@ -125,6 +135,7 @@ typedef struct SlippiInputSuggestion {
  * What happened on a local frame: how many times the game has polled the controller port and what it sent.
  */
 typedef struct SlippiInputSuggestionsLocalFrame {
+  uint8_t player_idx;
   int32_t frame;
   bool is_skip;
   bool is_advancing;
@@ -138,6 +149,14 @@ typedef struct SlippiInputSuggestionsLocalFrame {
   uint8_t analog_mode;
   uint8_t sent_pad[8];
 } SlippiInputSuggestionsLocalFrame;
+
+/**
+ * A batch of suggestions produced by an adapter report (at most one per local player).
+ */
+typedef struct SlippiInputSuggestionBatch {
+  uint8_t count;
+  struct SlippiInputSuggestion suggestions[4];
+} SlippiInputSuggestionBatch;
 
 /**
  * Settings for a game, passed when it starts.
@@ -420,11 +439,11 @@ struct SlippiInputSuggestion slprs_input_suggestions_on_local_frame(struct Slipp
 
 /**
  * Reports an adapter input report. Call on the adapter read thread. `game_poll_counts` points at four
- * counts, one per port. Send the returned suggestion if it is valid.
+ * counts, one per port. Send every valid suggestion in the returned batch.
  */
-struct SlippiInputSuggestion slprs_input_suggestions_on_adapter_report(const uint64_t *game_poll_counts,
-                                                                       const uint8_t *payload,
-                                                                       uintptr_t payload_len);
+struct SlippiInputSuggestionBatch slprs_input_suggestions_on_adapter_report(const uint64_t *game_poll_counts,
+                                                                            const uint8_t *payload,
+                                                                            uintptr_t payload_len);
 
 /**
  * Reports a suggestion received from a remote player. `pad` points at 8 bytes. Call on the netplay thread.

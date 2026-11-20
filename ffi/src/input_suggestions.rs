@@ -5,12 +5,17 @@
 
 use std::slice;
 
-use slippi_input_suggestions::{Calibration, GameConfig, LocalFrame, PAD_SIZE, PREDICTED_FRAME_COUNT, Suggestion};
+use slippi_input_suggestions::{
+    Calibration, GameConfig, LocalFrame, LocalPlayerConfig, MAX_LOCAL_PLAYERS, PAD_SIZE, PREDICTED_FRAME_COUNT,
+    Suggestion, SuggestionBatch,
+};
 
 /// A suggestion the caller should send to the opponents. Ignore it unless `is_valid` is set.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct SlippiInputSuggestion {
     pub is_valid: bool,
+    pub player_idx: u8,
     pub target_frame: i32,
     pub seq: u32,
     pub pad: [u8; 8],
@@ -21,18 +26,50 @@ impl From<Option<Suggestion>> for SlippiInputSuggestion {
         match suggestion {
             Some(s) => Self {
                 is_valid: true,
+                player_idx: s.player_idx,
                 target_frame: s.target_frame,
                 seq: s.seq,
                 pad: s.pad,
             },
             None => Self {
                 is_valid: false,
+                player_idx: 0,
                 target_frame: 0,
                 seq: 0,
                 pad: [0; 8],
             },
         }
     }
+}
+
+/// A batch of suggestions produced by an adapter report (at most one per local player).
+#[repr(C)]
+pub struct SlippiInputSuggestionBatch {
+    pub count: u8,
+    pub suggestions: [SlippiInputSuggestion; 4],
+}
+
+impl From<SuggestionBatch> for SlippiInputSuggestionBatch {
+    fn from(batch: SuggestionBatch) -> Self {
+        let mut suggestions = [None.into(); 4];
+        let count = batch.count.min(4);
+        for i in 0..count {
+            suggestions[i] = batch.items[i].into();
+        }
+        Self {
+            count: count as u8,
+            suggestions,
+        }
+    }
+}
+
+/// Adapter and slot settings for one local player, passed inside `SlippiInputSuggestionsGameConfig`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SlippiInputSuggestionsLocalPlayerConfig {
+    pub player_idx: u8,
+    pub source_port: u8,
+    pub source_is_adapter: bool,
 }
 
 /// Settings for a game, passed when it starts.
@@ -42,13 +79,14 @@ pub struct SlippiInputSuggestionsGameConfig {
     pub local_player_idx: u8,
     pub remote_player_count: u8,
     pub delay: u8,
-    pub source_port: u8,
-    pub source_is_adapter: bool,
+    pub local_player_count: u8,
+    pub local_players: [SlippiInputSuggestionsLocalPlayerConfig; 4],
 }
 
 /// What happened on a local frame: how many times the game has polled the controller port and what it sent.
 #[repr(C)]
 pub struct SlippiInputSuggestionsLocalFrame {
+    pub player_idx: u8,
     pub frame: i32,
     pub is_skip: bool,
     pub is_advancing: bool,
@@ -64,13 +102,22 @@ pub struct SlippiInputSuggestionsLocalFrame {
 /// Starts tracking a game. Call on the CPU thread when the game's first online frame is handled.
 #[unsafe(no_mangle)]
 pub extern "C" fn slprs_input_suggestions_start_game(config: SlippiInputSuggestionsGameConfig) {
+    let local_count = usize::from(config.local_player_count).min(MAX_LOCAL_PLAYERS);
+    let local_players = config.local_players[..local_count]
+        .iter()
+        .map(|player| LocalPlayerConfig {
+            player_idx: player.player_idx,
+            source_port: player.source_port,
+            source_is_adapter: player.source_is_adapter,
+        })
+        .collect();
+
     slippi_input_suggestions::start_game(GameConfig {
         enabled: config.enabled,
         local_player_idx: config.local_player_idx,
         remote_player_count: config.remote_player_count,
         delay: config.delay,
-        source_port: config.source_port,
-        source_is_adapter: config.source_is_adapter,
+        local_players,
     });
 }
 
@@ -90,6 +137,7 @@ pub extern "C" fn slprs_input_suggestions_on_local_frame(frame: SlippiInputSugge
     });
 
     slippi_input_suggestions::on_local_frame(LocalFrame {
+        player_idx: frame.player_idx,
         frame: frame.frame,
         is_skip: frame.is_skip,
         is_advancing: frame.is_advancing,
@@ -101,15 +149,15 @@ pub extern "C" fn slprs_input_suggestions_on_local_frame(frame: SlippiInputSugge
 }
 
 /// Reports an adapter input report. Call on the adapter read thread. `game_poll_counts` points at four
-/// counts, one per port. Send the returned suggestion if it is valid.
+/// counts, one per port. Send every valid suggestion in the returned batch.
 #[unsafe(no_mangle)]
 pub extern "C" fn slprs_input_suggestions_on_adapter_report(
     game_poll_counts: *const u64,
     payload: *const u8,
     payload_len: usize,
-) -> SlippiInputSuggestion {
+) -> SlippiInputSuggestionBatch {
     if game_poll_counts.is_null() || payload.is_null() {
-        return None.into();
+        return SuggestionBatch::default().into();
     }
 
     // The C++ side owns both buffers for the duration of the call.

@@ -26,6 +26,20 @@ pub use remote::PREDICTED_FRAME_COUNT;
 use pad::{START_SYNC_FRAME, adapter_to_pad, is_meaningful_change};
 use remote::Remote;
 
+/// Maximum number of local players supported on one host (GameCube has 4 ports).
+pub const MAX_LOCAL_PLAYERS: usize = 4;
+
+/// Adapter and slot configuration for a single local player.
+#[derive(Clone, Copy, Debug)]
+pub struct LocalPlayerConfig {
+    /// Melee player slot index (0..=3) for this local player.
+    pub player_idx: u8,
+    /// The controller port (0..=3) the game reads this local player's inputs from.
+    pub source_port: u8,
+    /// Whether that port is a GameCube adapter port. Suggestions are only produced for the adapter.
+    pub source_is_adapter: bool,
+}
+
 /// Settings for a game, gathered by the EXI device when the game starts.
 #[derive(Clone, Debug)]
 pub struct GameConfig {
@@ -34,15 +48,14 @@ pub struct GameConfig {
     pub local_player_idx: u8,
     pub remote_player_count: u8,
     pub delay: u8,
-    /// The controller port the game reads the local player's inputs from.
-    pub source_port: u8,
-    /// Whether that port is a GameCube adapter port. Suggestions are only produced for the adapter.
-    pub source_is_adapter: bool,
+    pub local_players: Vec<LocalPlayerConfig>,
 }
 
 /// Facts about a local frame, reported right after the game polled and sent its input.
 #[derive(Clone, Copy, Debug)]
 pub struct LocalFrame {
+    /// Melee player slot index (0..=3) for the local player reporting this frame.
+    pub player_idx: u8,
     pub frame: i32,
     /// The frame is being skipped for time sync, so the polled input was not sent and the same frame
     /// will be polled again.
@@ -58,10 +71,28 @@ pub struct LocalFrame {
 /// A suggestion to send to the opponents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Suggestion {
+    /// Melee player slot index (0..=3) of the local player that produced this suggestion.
+    pub player_idx: u8,
     /// The first frame (in the sender's frame numbering, delay included) the input applies to.
     pub target_frame: i32,
     pub seq: u32,
     pub pad: Pad,
+}
+
+/// Fixed-capacity batch of suggestions emitted for a single adapter report without heap allocation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SuggestionBatch {
+    pub count: usize,
+    pub items: [Option<Suggestion>; MAX_LOCAL_PLAYERS],
+}
+
+impl SuggestionBatch {
+    fn push(&mut self, suggestion: Suggestion) {
+        if self.count < MAX_LOCAL_PLAYERS {
+            self.items[self.count] = Some(suggestion);
+            self.count += 1;
+        }
+    }
 }
 
 /// A report stored after a game poll that has not been handled yet. It is for the frame after that poll's,
@@ -72,9 +103,10 @@ struct PendingReport {
     port_data: AdapterPortData,
 }
 
-struct Game {
-    config: GameConfig,
-    /// Suggestions are enabled and the local player is on a GameCube adapter port.
+struct LocalSender {
+    player_idx: u8,
+    source_port: u8,
+    /// Suggestions are enabled and this local player is on a GameCube adapter port.
     sending: bool,
     calibration: Option<Calibration>,
     /// The game's poll count as of the frame most recently handled by `on_local_frame`.
@@ -85,42 +117,21 @@ struct Game {
     last_communicated: Option<Pad>,
     pending: Option<PendingReport>,
     next_seq: u32,
-    remotes: Vec<Remote>,
 }
 
-impl Game {
-    fn new(config: GameConfig) -> Self {
-        let remotes = (0..config.remote_player_count)
-            .map(|i| {
-                let port = if i >= config.local_player_idx { i + 1 } else { i };
-                Remote::new(port)
-            })
-            .collect();
-
-        tracing::info!(
-            target: Log::SlippiOnline,
-            enabled = config.enabled,
-            delay = config.delay,
-            source_port = config.source_port + 1,
-            source_is_adapter = config.source_is_adapter,
-            "[InputSuggestions] Game started"
-        );
-
+impl LocalSender {
+    fn new(enabled: bool, config: LocalPlayerConfig) -> Self {
         Self {
-            sending: config.enabled && config.source_is_adapter,
-            config,
+            player_idx: config.player_idx,
+            source_port: config.source_port,
+            sending: enabled && config.source_is_adapter,
             calibration: None,
             handled_poll_count: None,
             next_poll_frame: 1,
             last_communicated: None,
             pending: None,
             next_seq: 0,
-            remotes,
         }
-    }
-
-    fn delay(&self) -> i32 {
-        self.config.delay as i32
     }
 
     fn can_send(&self) -> bool {
@@ -133,9 +144,9 @@ impl Game {
 
     /// Sends `pad` as a suggestion for the next polled frame if it says something the opponents don't
     /// know yet.
-    fn suggest(&mut self, pad: Pad) -> Option<Suggestion> {
+    fn suggest(&mut self, delay: i32, pad: Pad) -> Option<Suggestion> {
         // The ASM zeroes inputs polled before this frame, so there is nothing to suggest
-        if self.next_poll_frame < START_SYNC_FRAME - self.delay() {
+        if self.next_poll_frame < START_SYNC_FRAME - delay {
             return None;
         }
 
@@ -147,19 +158,20 @@ impl Game {
         self.last_communicated = Some(pad);
 
         Some(Suggestion {
-            target_frame: self.next_poll_frame + self.delay(),
+            player_idx: self.player_idx,
+            target_frame: self.next_poll_frame + delay,
             seq: self.next_seq,
             pad,
         })
     }
 
     /// `poll_counts` are the game's poll counts of each port when the report was stored.
-    fn on_adapter_report(&mut self, poll_counts: &[u64; 4], payload: &[u8]) -> Option<Suggestion> {
+    fn on_adapter_report(&mut self, delay: i32, poll_counts: &[u64; 4], payload: &[u8]) -> Option<Suggestion> {
         if !self.can_send() {
             return None;
         }
 
-        let port = self.config.source_port as usize;
+        let port = self.source_port as usize;
         let start = 1 + ADAPTER_PORT_DATA_SIZE * port;
         let port_data: AdapterPortData = payload.get(start..start + ADAPTER_PORT_DATA_SIZE)?.try_into().ok()?;
         let handled_count = self.handled_poll_count?;
@@ -178,10 +190,10 @@ impl Game {
         }
 
         let pad = self.transform(&port_data)?;
-        self.suggest(pad)
+        self.suggest(delay, pad)
     }
 
-    fn on_local_frame(&mut self, info: LocalFrame) -> Option<Suggestion> {
+    fn on_local_frame(&mut self, delay: i32, info: LocalFrame) -> Option<Suggestion> {
         if let Some(calibration) = info.calibration {
             self.calibration = Some(calibration);
         }
@@ -219,9 +231,76 @@ impl Game {
         }
 
         match candidate {
-            Some(pad) if self.can_send() => self.suggest(pad),
+            Some(pad) if self.can_send() => self.suggest(delay, pad),
             _ => None,
         }
+    }
+}
+
+struct Game {
+    enabled: bool,
+    delay: i32,
+    locals: Vec<LocalSender>,
+    remotes: Vec<Remote>,
+}
+
+impl Game {
+    fn new(config: GameConfig) -> Self {
+        let remotes = (0..config.remote_player_count)
+            .map(|i| {
+                let port = if i >= config.local_player_idx { i + 1 } else { i };
+                Remote::new(port)
+            })
+            .collect();
+
+        let locals: Vec<LocalSender> = config
+            .local_players
+            .iter()
+            .take(MAX_LOCAL_PLAYERS)
+            .map(|&cfg| LocalSender::new(config.enabled, cfg))
+            .collect();
+
+        tracing::info!(
+            target: Log::SlippiOnline,
+            enabled = config.enabled,
+            delay = config.delay,
+            local_player_count = locals.len(),
+            "[InputSuggestions] Game started"
+        );
+        for local in &locals {
+            tracing::info!(
+                target: Log::SlippiOnline,
+                player_idx = local.player_idx,
+                source_port = local.source_port + 1,
+                source_is_adapter = local.sending,
+                "[InputSuggestions] Local sender configured"
+            );
+        }
+
+        Self {
+            enabled: config.enabled,
+            delay: config.delay as i32,
+            locals,
+            remotes,
+        }
+    }
+
+    /// `poll_counts` are the game's poll counts of each port when the report was stored.
+    fn on_adapter_report(&mut self, poll_counts: &[u64; 4], payload: &[u8]) -> SuggestionBatch {
+        let mut batch = SuggestionBatch::default();
+        for local in &mut self.locals {
+            if let Some(suggestion) = local.on_adapter_report(self.delay, poll_counts, payload) {
+                batch.push(suggestion);
+            }
+        }
+        batch
+    }
+
+    fn on_local_frame(&mut self, info: LocalFrame) -> Option<Suggestion> {
+        self.locals
+            .iter_mut()
+            .find(|local| local.player_idx == info.player_idx)?
+            .on_local_frame(self.delay, info)
     }
 
     fn on_remote_input(&mut self, remote_idx: usize, frame: i32, pad: Pad) {
@@ -247,7 +326,7 @@ impl Game {
         latest: &[u8; 12],
     ) -> [[u8; 12]; PREDICTED_FRAME_COUNT] {
         let mut out = [*latest; PREDICTED_FRAME_COUNT];
-        if !self.config.enabled || is_disconnected {
+        if !self.enabled || is_disconnected {
             return out;
         }
 
@@ -282,9 +361,12 @@ pub fn on_local_frame(frame: LocalFrame) -> Option<Suggestion> {
     lock().as_mut()?.on_local_frame(frame)
 }
 
-/// Called on the adapter read thread for each report. May return a suggestion that the caller must send.
-pub fn on_adapter_report(poll_counts: &[u64; 4], payload: &[u8]) -> Option<Suggestion> {
-    lock().as_mut()?.on_adapter_report(poll_counts, payload)
+/// Called on the adapter read thread for each report. Returns any suggestions to send.
+pub fn on_adapter_report(poll_counts: &[u64; 4], payload: &[u8]) -> SuggestionBatch {
+    match lock().as_mut() {
+        Some(game) => game.on_adapter_report(poll_counts, payload),
+        None => SuggestionBatch::default(),
+    }
 }
 
 pub fn on_remote_suggestion(remote_idx: usize, target_frame: i32, seq: u32, pad: Pad) {
@@ -325,14 +407,21 @@ pub fn fill_predictions(
 mod tests {
     use super::*;
 
+    fn local_cfg(player_idx: u8, source_port: u8, source_is_adapter: bool) -> LocalPlayerConfig {
+        LocalPlayerConfig {
+            player_idx,
+            source_port,
+            source_is_adapter,
+        }
+    }
+
     fn config() -> GameConfig {
         GameConfig {
             enabled: true,
             local_player_idx: 0,
             remote_player_count: 1,
             delay: 2,
-            source_port: 0,
-            source_is_adapter: true,
+            local_players: vec![local_cfg(0, 0, true)],
         }
     }
 
@@ -346,21 +435,33 @@ mod tests {
     }
 
     fn payload(port: AdapterPortData) -> [u8; 37] {
+        payload_ports([port, [0; 9], [0; 9], [0; 9]])
+    }
+
+    fn payload_ports(ports: [AdapterPortData; 4]) -> [u8; 37] {
         let mut p = [0; 37];
         p[0] = 0x21;
-        p[1..10].copy_from_slice(&port);
+        for (i, port) in ports.iter().enumerate() {
+            let start = 1 + i * ADAPTER_PORT_DATA_SIZE;
+            p[start..start + ADAPTER_PORT_DATA_SIZE].copy_from_slice(port);
+        }
         p
     }
 
-    fn local_frame(frame: i32, poll_count: u64, data: AdapterPortData) -> LocalFrame {
+    fn local_frame_for(player_idx: u8, frame: i32, poll_count: u64, calibration: Calibration, data: AdapterPortData) -> LocalFrame {
         LocalFrame {
+            player_idx,
             frame,
             is_skip: false,
             is_advancing: false,
             poll_count: Some(poll_count),
-            calibration: Some(CALIBRATION),
-            sent_pad: adapter_to_pad(&data, &CALIBRATION).unwrap(),
+            calibration: Some(calibration),
+            sent_pad: adapter_to_pad(&data, &calibration).unwrap(),
         }
+    }
+
+    fn local_frame(frame: i32, poll_count: u64, data: AdapterPortData) -> LocalFrame {
+        local_frame_for(0, frame, poll_count, CALIBRATION, data)
     }
 
     fn frame(game: &mut Game, frame: i32, poll_count: u64, data: AdapterPortData, skip: bool) -> Option<Suggestion> {
@@ -370,20 +471,29 @@ mod tests {
         })
     }
 
+    fn single_suggestion(batch: SuggestionBatch) -> Option<Suggestion> {
+        match batch.count {
+            0 => None,
+            1 => batch.items[0],
+            n => panic!("expected at most 1 suggestion, got {n}"),
+        }
+    }
+
     #[test]
     fn change_between_polls_targets_next_frame() {
         let mut game = Game::new(config());
         assert_eq!(frame(&mut game, 100, 1, port_data(128, false), false), None);
 
         // Noise is not sent
-        assert_eq!(game.on_adapter_report(&[1, 0, 0, 0], &payload(port_data(129, false))), None);
+        assert_eq!(single_suggestion(game.on_adapter_report(&[1, 0, 0, 0], &payload(port_data(129, false)))), None);
 
-        let s = game.on_adapter_report(&[1, 0, 0, 0], &payload(port_data(128, true))).unwrap();
+        let s = single_suggestion(game.on_adapter_report(&[1, 0, 0, 0], &payload(port_data(128, true)))).unwrap();
+        assert_eq!(s.player_idx, 0);
         assert_eq!(s.target_frame, 103);
         assert_eq!(s.seq, 1);
 
         // The same input again says nothing new
-        assert_eq!(game.on_adapter_report(&[1, 0, 0, 0], &payload(port_data(128, true))), None);
+        assert_eq!(single_suggestion(game.on_adapter_report(&[1, 0, 0, 0], &payload(port_data(128, true)))), None);
     }
 
     /// A report stored at the same poll count as the last handled poll is for the next frame (see
@@ -394,12 +504,12 @@ mod tests {
         // Poll 5 is handled, so a report stored at count 4 was read by it and its input already sent
         let mut game = Game::new(config());
         frame(&mut game, 100, 5, port_data(128, false), false);
-        assert_eq!(game.on_adapter_report(&[4, 0, 0, 0], &payload(port_data(200, false))), None);
+        assert_eq!(single_suggestion(game.on_adapter_report(&[4, 0, 0, 0], &payload(port_data(200, false)))), None);
 
         // This report was stored after poll 2, which hasn't been handled yet, so it waits for that poll
         let mut game = Game::new(config());
         frame(&mut game, 100, 1, port_data(128, false), false);
-        assert_eq!(game.on_adapter_report(&[2, 0, 0, 0], &payload(port_data(200, false))), None);
+        assert_eq!(single_suggestion(game.on_adapter_report(&[2, 0, 0, 0], &payload(port_data(200, false)))), None);
         // Once poll 2 is handled as frame 101, the report is for frame 102 (+2 delay)
         let s = frame(&mut game, 101, 2, port_data(128, false), false).unwrap();
         assert_eq!(s.target_frame, 104);
@@ -435,21 +545,19 @@ mod tests {
         // Stored after poll 1 but before frame 100 was handled
         let mut game = Game::new(config());
         frame(&mut game, 99, 0, neutral, false);
-        assert_eq!(game.on_adapter_report(&[1, 0, 0, 0], &payload(port_data(128, true))), None);
+        assert_eq!(single_suggestion(game.on_adapter_report(&[1, 0, 0, 0], &payload(port_data(128, true)))), None);
         let s = game.on_local_frame(advancing(100, 1)).unwrap();
         assert_eq!(s.target_frame, 104);
 
         // Stored after frame 100 was handled
         let mut game = Game::new(config());
         game.on_local_frame(advancing(100, 1));
-        let s = game.on_adapter_report(&[1, 0, 0, 0], &payload(port_data(128, true))).unwrap();
+        let s = single_suggestion(game.on_adapter_report(&[1, 0, 0, 0], &payload(port_data(128, true)))).unwrap();
         assert_eq!(s.target_frame, 104);
 
         // The advanced frame 101 doesn't poll, and the next poll is still frame 102's
         assert_eq!(frame(&mut game, 101, 1, neutral, false), None);
-        let s = game
-            .on_adapter_report(&[1, 0, 0, 0], &payload(port_data(200, false)))
-            .unwrap();
+        let s = single_suggestion(game.on_adapter_report(&[1, 0, 0, 0], &payload(port_data(200, false)))).unwrap();
         assert_eq!(s.target_frame, 104);
     }
 
@@ -457,7 +565,7 @@ mod tests {
     fn nothing_is_sent_for_frozen_frames() {
         let mut game = Game::new(config());
         frame(&mut game, 10, 1, port_data(128, false), false);
-        assert_eq!(game.on_adapter_report(&[1, 0, 0, 0], &payload(port_data(128, true))), None);
+        assert_eq!(single_suggestion(game.on_adapter_report(&[1, 0, 0, 0], &payload(port_data(128, true)))), None);
     }
 
     #[test]
@@ -468,13 +576,13 @@ mod tests {
                 ..config()
             },
             GameConfig {
-                source_is_adapter: false,
+                local_players: vec![local_cfg(0, 0, false)],
                 ..config()
             },
         ] {
             let mut game = Game::new(config);
             frame(&mut game, 100, 1, port_data(128, false), false);
-            assert_eq!(game.on_adapter_report(&[1, 0, 0, 0], &payload(port_data(128, true))), None);
+            assert_eq!(single_suggestion(game.on_adapter_report(&[1, 0, 0, 0], &payload(port_data(128, true)))), None);
         }
     }
 
@@ -510,9 +618,7 @@ mod tests {
         receiver.on_remote_input(0, 100, neutral);
 
         // A pressed between polls 100 and 101, so it first applies to 101 + delay = 103
-        let s = sender
-            .on_adapter_report(&[1, 0, 0, 0], &payload(port_data(128, true)))
-            .unwrap();
+        let s = single_suggestion(sender.on_adapter_report(&[1, 0, 0, 0], &payload(port_data(128, true)))).unwrap();
         receiver.remotes[0].on_suggestion(s.target_frame, s.seq, s.pad);
 
         // The receiver has real inputs up to 100 and must predict 101..=103
@@ -522,5 +628,153 @@ mod tests {
         assert_eq!(out[0][..8], neutral);
         assert_eq!(out[1][..8], neutral);
         assert_eq!(out[2][..8], pressed);
+    }
+
+    #[test]
+    fn simultaneous_local_players_suggest_independently() {
+        // Player slot 1 reads adapter port 2; player slot 3 reads adapter port 0 with a shifted origin.
+        let mut game = Game::new(GameConfig {
+            enabled: true,
+            local_player_idx: 1,
+            remote_player_count: 3,
+            delay: 2,
+            local_players: vec![local_cfg(1, 2, true), local_cfg(3, 0, true)],
+        });
+
+        let p3_cal = Calibration {
+            origin: [138, 128, 128, 128, 0, 0],
+            analog_mode: 3,
+        };
+        assert_eq!(game.on_local_frame(local_frame_for(1, 100, 10, CALIBRATION, port_data(128, false))), None);
+        assert_eq!(game.on_local_frame(local_frame_for(3, 100, 20, p3_cal, port_data(138, false))), None);
+
+        // Both players change inputs in the same adapter report: port 2 presses A, port 0 dashes right past its origin.
+        let report = payload_ports([port_data(208, false), [0; 9], port_data(128, true), [0; 9]]);
+        let batch = game.on_adapter_report(&[20, 0, 10, 0], &report);
+        assert_eq!(batch.count, 2);
+
+        let s1 = batch.items[0].unwrap();
+        assert_eq!(s1.player_idx, 1);
+        assert_eq!(s1.target_frame, 103);
+        assert_eq!(s1.seq, 1);
+        assert_eq!(s1.pad, adapter_to_pad(&port_data(128, true), &CALIBRATION).unwrap());
+
+        let s3 = batch.items[1].unwrap();
+        assert_eq!(s3.player_idx, 3);
+        assert_eq!(s3.target_frame, 103);
+        assert_eq!(s3.seq, 1);
+        assert_eq!(s3.pad, adapter_to_pad(&port_data(208, false), &p3_cal).unwrap());
+
+        // Subsequent report where only slot 3 changes keeps seq independent (slot 3 -> seq 2).
+        let report2 = payload_ports([port_data(208, true), [0; 9], port_data(128, true), [0; 9]]);
+        let batch2 = game.on_adapter_report(&[20, 0, 10, 0], &report2);
+        assert_eq!(batch2.count, 1);
+        let s3_next = batch2.items[0].unwrap();
+        assert_eq!(s3_next.player_idx, 3);
+        assert_eq!(s3_next.seq, 2);
+    }
+
+    #[test]
+    fn mixed_adapter_and_non_adapter_local_players() {
+        let mut game = Game::new(GameConfig {
+            enabled: true,
+            local_player_idx: 0,
+            remote_player_count: 3,
+            delay: 2,
+            local_players: vec![local_cfg(0, 0, true), local_cfg(2, 1, false)],
+        });
+
+        assert_eq!(game.on_local_frame(local_frame_for(0, 100, 1, CALIBRATION, port_data(128, false))), None);
+        assert_eq!(game.on_local_frame(local_frame_for(2, 100, 1, CALIBRATION, port_data(128, false))), None);
+
+        let report = payload_ports([port_data(128, true), port_data(200, true), [0; 9], [0; 9]]);
+        let batch = game.on_adapter_report(&[1, 1, 0, 0], &report);
+        assert_eq!(batch.count, 1);
+        assert_eq!(batch.items[0].unwrap().player_idx, 0);
+    }
+
+    #[test]
+    fn independent_pending_and_skipped_frames_for_multiple_local_players() {
+        let mut game = Game::new(GameConfig {
+            enabled: true,
+            local_player_idx: 0,
+            remote_player_count: 3,
+            delay: 2,
+            local_players: vec![local_cfg(0, 0, true), local_cfg(1, 1, true)],
+        });
+
+        frame(&mut game, 100, 1, port_data(128, false), false);
+        assert_eq!(game.on_local_frame(local_frame_for(1, 100, 1, CALIBRATION, port_data(128, false))), None);
+
+        // Port 0 has an in-flight poll (count 2 > handled 1) so it queues pending; port 1 matches handled count 1 so it emits immediately.
+        let report = payload_ports([port_data(200, false), port_data(128, true), [0; 9], [0; 9]]);
+        let batch = game.on_adapter_report(&[2, 1, 0, 0], &report);
+        assert_eq!(batch.count, 1);
+        assert_eq!(batch.items[0].unwrap().player_idx, 1);
+        assert_eq!(batch.items[0].unwrap().target_frame, 103);
+
+        // Now handle poll 2 for player 0 -> releases pending suggestion for frame 102 + 2 = 104.
+        let released = frame(&mut game, 101, 2, port_data(128, false), false).unwrap();
+        assert_eq!(released.player_idx, 0);
+        assert_eq!(released.target_frame, 104);
+
+        // Skipped frames for both local players each emit their own suggestion for frame 102 + 2 = 104.
+        let skip0 = frame(&mut game, 102, 3, port_data(128, true), true).unwrap();
+        assert_eq!(skip0.player_idx, 0);
+        assert_eq!(skip0.target_frame, 104);
+
+        let skip1 = game
+            .on_local_frame(LocalFrame {
+                is_skip: true,
+                ..local_frame_for(1, 102, 2, CALIBRATION, port_data(200, false))
+            })
+            .unwrap();
+        assert_eq!(skip1.player_idx, 1);
+        assert_eq!(skip1.target_frame, 104);
+    }
+
+    #[test]
+    fn two_local_senders_reach_remote_receiver_predictions() {
+        let mut sender = Game::new(GameConfig {
+            enabled: true,
+            local_player_idx: 0,
+            remote_player_count: 3,
+            delay: 2,
+            local_players: vec![local_cfg(0, 0, true), local_cfg(2, 1, true)],
+        });
+        let mut receiver = Game::new(GameConfig {
+            enabled: true,
+            local_player_idx: 1,
+            remote_player_count: 3,
+            delay: 2,
+            local_players: vec![local_cfg(1, 0, true)],
+        });
+
+        let neutral = adapter_to_pad(&port_data(128, false), &CALIBRATION).unwrap();
+        let pressed = adapter_to_pad(&port_data(128, true), &CALIBRATION).unwrap();
+        let dashed = adapter_to_pad(&port_data(200, false), &CALIBRATION).unwrap();
+
+        frame(&mut sender, 100, 1, port_data(128, false), false);
+        sender.on_local_frame(local_frame_for(2, 100, 1, CALIBRATION, port_data(128, false)));
+
+        // On receiver (player_idx 1), remote_idx 0 is player 0 and remote_idx 1 is player 2.
+        receiver.on_remote_input(0, 100, neutral);
+        receiver.on_remote_input(1, 100, neutral);
+
+        let report = payload_ports([port_data(128, true), port_data(200, false), [0; 9], [0; 9]]);
+        let batch = sender.on_adapter_report(&[1, 1, 0, 0], &report);
+        assert_eq!(batch.count, 2);
+
+        for s in batch.items.into_iter().flatten() {
+            let remote_idx = if s.player_idx == 0 { 0 } else { 1 };
+            receiver.remotes[remote_idx].on_suggestion(s.target_frame, s.seq, s.pad);
+        }
+
+        let mut latest = [0; 12];
+        latest[..8].copy_from_slice(&neutral);
+        let out0 = receiver.fill_predictions(0, 100, false, &latest);
+        let out1 = receiver.fill_predictions(1, 100, false, &latest);
+        assert_eq!(out0[2][..8], pressed);
+        assert_eq!(out1[2][..8], dashed);
     }
 }
