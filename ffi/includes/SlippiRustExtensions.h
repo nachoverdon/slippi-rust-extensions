@@ -241,6 +241,19 @@ typedef struct SlippiMatchmakingRequest {
    * order they were asked. The NAT is classified from them on this side.
    */
   struct SlippiStunObservation stun[2];
+  /**
+   * When true, do not cancel other active matchmaking sessions on the same
+   * device (used by local Teams players sharing one Dolphin process).
+   */
+  bool allow_concurrent;
+  /**
+   * Optional explicit user identity overriding `UserManager`; ignored unless
+   * both `user_uid` and `user_play_key` are non-null and non-empty.
+   */
+  const char *user_uid;
+  const char *user_play_key;
+  const char *user_connect_code;
+  const char *user_display_name;
 } SlippiMatchmakingRequest;
 
 /**
@@ -560,26 +573,27 @@ void slprs_match_quality_end_game(void);
 bool slprs_match_quality_on_frame(struct SlippiMatchQualityFrame frame);
 
 /**
- * Starts a matchmaking session and returns its id. Any session already
- * running is cancelled first. Progress is polled with `slprs_mm_state`.
+ * Starts a matchmaking session and returns its id. Unless
+ * `request.allow_concurrent` is set, any session already running is cancelled
+ * first. Progress is polled with `slprs_mm_state`.
  */
 uint64_t slprs_mm_start(uintptr_t exi_device_instance_ptr, struct SlippiMatchmakingRequest request);
 
 /**
  * Current session state: 0 idle, 1 connecting, 2 queued, 3 matched, 4 failed.
  */
-int slprs_mm_state(uintptr_t exi_device_instance_ptr);
+int slprs_mm_state(uintptr_t exi_device_instance_ptr, uint64_t session_id);
 
 /**
  * Once the state is matched, returns the match message exactly as the service
  * sent it, or null if it was already taken. Free with `slprs_mm_free_string`.
  */
-char *slprs_mm_take_result_json(uintptr_t exi_device_instance_ptr);
+char *slprs_mm_take_result_json(uintptr_t exi_device_instance_ptr, uint64_t session_id);
 
 /**
  * Once the state is failed, returns why. Free with `slprs_mm_free_string`.
  */
-char *slprs_mm_error_message(uintptr_t exi_device_instance_ptr);
+char *slprs_mm_error_message(uintptr_t exi_device_instance_ptr, uint64_t session_id);
 
 /**
  * Leaves the queue and ends the session with the given id. A stale id from an

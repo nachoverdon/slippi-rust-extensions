@@ -1,5 +1,6 @@
 //! The WebSocket matchmaking session.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddrV4, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -80,6 +81,8 @@ pub struct MatchRequest {
     /// socket, in the order they were asked. None where a server did not
     /// answer. Two answers are needed to classify the NAT.
     pub stun: [Option<SocketAddrV4>; 2],
+    /// Optional explicit user credentials/identity instead of `user_manager`.
+    pub user_override: Option<protocol::UserInfo>,
     /// Only honored by a service running with authentication disabled.
     pub debug: Option<DebugOverrides>,
 }
@@ -123,18 +126,21 @@ pub struct MatchmakingClient {
     inner: Mutex<Inner>,
 }
 
+#[derive(Debug)]
+struct SessionHandle {
+    shared: Arc<Shared>,
+    worker: Option<JoinHandle<()>>,
+}
+
 /// The part that changes as sessions start and end. It sits behind a mutex
 /// because the Dolphin side reaches it from more than one thread: an old
-/// matchmaking object winding down on a cleanup thread while a new one starts
-/// the next search.
+/// matchmaking object winding down on a cleanup thread, or multiple local Teams
+/// sessions running in parallel.
 #[derive(Debug)]
 struct Inner {
-    shared: Arc<Shared>,
-    /// The worker is never joined, so cancelling does not wait on a connect
-    /// or handshake in progress. The handle is kept only until the next
-    /// session replaces it.
-    worker: Option<JoinHandle<()>>,
-    session_id: u64,
+    next_session_id: u64,
+    latest_session_id: u64,
+    sessions: HashMap<u64, SessionHandle>,
 }
 
 impl MatchmakingClient {
@@ -149,14 +155,18 @@ impl MatchmakingClient {
             }
         });
 
+        Self::with_url(user_manager, slippi_semver, url)
+    }
+
+    fn with_url(user_manager: UserManager, slippi_semver: String, url: String) -> Self {
         Self {
             user_manager,
             slippi_semver,
             url,
             inner: Mutex::new(Inner {
-                shared: Arc::new(Shared::default()),
-                worker: None,
-                session_id: 0,
+                next_session_id: 0,
+                latest_session_id: 0,
+                sessions: HashMap::new(),
             }),
         }
     }
@@ -169,70 +179,145 @@ impl MatchmakingClient {
     /// Begins a session and returns its id. Any previous session is cancelled
     /// first.
     pub fn start(&self, request: MatchRequest) -> u64 {
+        self.start_inner(request, true)
+    }
+
+    /// Begins a session without cancelling existing sessions, allowing multiple
+    /// local Teams players on the same client to queue and match concurrently.
+    pub fn start_concurrent(&self, request: MatchRequest) -> u64 {
+        self.start_inner(request, false)
+    }
+
+    fn start_inner(&self, request: MatchRequest, cancel_existing: bool) -> u64 {
         let join = self.build_join(&request);
         let url = self.url.clone();
         let user_manager = self.user_manager.clone();
 
-        let mut inner = self.inner.lock().unwrap();
-        Self::cancel_inner(&mut inner);
+        let (session_id, previous) = {
+            let mut inner = self.inner.lock().unwrap();
+            let previous = if cancel_existing {
+                inner.sessions.drain().map(|(_, h)| h).collect()
+            } else {
+                Vec::new()
+            };
 
-        inner.session_id += 1;
-        let shared = Arc::new(Shared::default());
-        shared.set_state(MatchmakingState::Connecting);
-        inner.shared = shared.clone();
+            inner.next_session_id += 1;
+            let session_id = inner.next_session_id;
+            inner.latest_session_id = session_id;
 
-        tracing::info!(target: Log::SlippiOnline, "[Matchmaking] Starting session against {}", url);
+            let shared = Arc::new(Shared::default());
+            shared.set_state(MatchmakingState::Connecting);
 
-        inner.worker = Some(thread::spawn(move || {
-            Session {
-                shared,
-                url,
-                join,
-                user_manager,
-                ticket: None,
-                resume_deadline: None,
-                acknowledged: false,
-            }
-            .run();
-        }));
+            tracing::info!(
+                target: Log::SlippiOnline,
+                "[Matchmaking] Starting session {} against {}",
+                session_id,
+                url
+            );
 
-        inner.session_id
+            let worker_shared = shared.clone();
+            let worker = thread::spawn(move || {
+                Session {
+                    shared: worker_shared,
+                    url,
+                    join,
+                    user_manager,
+                    ticket: None,
+                    resume_deadline: None,
+                    acknowledged: false,
+                }
+                .run();
+            });
+
+            inner.sessions.insert(
+                session_id,
+                SessionHandle {
+                    shared,
+                    worker: Some(worker),
+                },
+            );
+
+            (session_id, previous)
+        };
+        for handle in previous {
+            Self::cancel_handle(handle);
+        }
+        session_id
     }
 
     /// Cancels the session with the given id. Ids from earlier sessions are
     /// ignored, so tearing down an old caller cannot end a newer search.
     pub fn cancel_session(&self, session_id: u64) {
-        let mut inner = self.inner.lock().unwrap();
-        if session_id == inner.session_id {
-            Self::cancel_inner(&mut inner);
+        let handle = self.inner.lock().unwrap().sessions.remove(&session_id);
+        if let Some(handle) = handle {
+            Self::cancel_handle(handle);
         }
     }
 
-    /// Current state of the session.
+    /// Current state of the most recently started session.
     pub fn state(&self) -> MatchmakingState {
-        self.inner.lock().unwrap().shared.state()
+        let id = self.inner.lock().unwrap().latest_session_id;
+        self.state_for(id)
+    }
+
+    /// Current state of a specific session.
+    pub fn state_for(&self, session_id: u64) -> MatchmakingState {
+        self.inner
+            .lock()
+            .unwrap()
+            .sessions
+            .get(&session_id)
+            .map(|handle| handle.shared.state())
+            .unwrap_or(MatchmakingState::Idle)
     }
 
     /// The match message as the service sent it, once the state is Matched.
     /// Each match is returned once.
     pub fn take_result_json(&self) -> Option<String> {
-        let inner = self.inner.lock().unwrap();
-        let taken = inner.shared.result_json.lock().unwrap().take();
+        let id = self.inner.lock().unwrap().latest_session_id;
+        self.take_result_json_for(id)
+    }
+
+    /// The match message for a specific session, returned once. Removes the
+    /// completed session entry once its result is taken.
+    pub fn take_result_json_for(&self, session_id: u64) -> Option<String> {
+        let mut inner = self.inner.lock().unwrap();
+        let taken = inner
+            .sessions
+            .get(&session_id)
+            .and_then(|handle| handle.shared.result_json.lock().unwrap().take());
+        if taken.is_some() {
+            if let Some(mut handle) = inner.sessions.remove(&session_id) {
+                drop(handle.worker.take());
+            }
+        }
         taken
     }
 
-    /// The failure reason, once the state is Failed.
+    /// The failure reason of the latest session, once the state is Failed.
     pub fn error_message(&self) -> String {
-        let inner = self.inner.lock().unwrap();
-        let message = inner.shared.error.lock().unwrap().clone();
-        message
+        let id = self.inner.lock().unwrap().latest_session_id;
+        self.error_message_for(id)
     }
 
-    /// Leaves the queue and ends the session. Safe to call at any time and
+    /// The failure reason for a specific session, once its state is Failed.
+    pub fn error_message_for(&self, session_id: u64) -> String {
+        self.inner
+            .lock()
+            .unwrap()
+            .sessions
+            .get(&session_id)
+            .map(|handle| handle.shared.error.lock().unwrap().clone())
+            .unwrap_or_default()
+    }
+
+    /// Leaves the queue and ends all sessions. Safe to call at any time and
     /// never blocks on the network.
     pub fn cancel(&self) {
-        let mut inner = self.inner.lock().unwrap();
-        Self::cancel_inner(&mut inner);
+        let handles: Vec<_> = self.inner.lock().unwrap().sessions.drain().map(|(_, h)| h).collect();
+        for handle in handles {
+            Self::cancel_handle(handle);
+        }
     }
 
     /// Flags the running session to stop. The worker notices within one read
@@ -240,17 +325,19 @@ impl MatchmakingClient {
     /// not joined: a worker stuck in a connect or handshake would otherwise
     /// hold up the caller for many seconds, and it touches nothing but its
     /// own shared state once flagged.
-    fn cancel_inner(inner: &mut Inner) {
-        inner.shared.cancel.store(true, Ordering::SeqCst);
-        drop(inner.worker.take());
+    fn cancel_handle(mut handle: SessionHandle) {
+        handle.shared.cancel.store(true, Ordering::SeqCst);
+        drop(handle.worker.take());
     }
 
     fn build_join(&self, request: &MatchRequest) -> protocol::Join {
-        let user = self.user_manager.get(|user| protocol::UserInfo {
-            uid: user.uid.clone(),
-            play_key: user.play_key.clone(),
-            connect_code: user.connect_code.clone(),
-            display_name: user.display_name.clone(),
+        let user = request.user_override.clone().unwrap_or_else(|| {
+            self.user_manager.get(|user| protocol::UserInfo {
+                uid: user.uid.clone(),
+                play_key: user.play_key.clone(),
+                connect_code: user.connect_code.clone(),
+                display_name: user.display_name.clone(),
+            })
         });
 
         // The NAT is classified from what two servers saw. The addresses themselves are
@@ -631,3 +718,414 @@ fn set_read_timeout(socket: &Socket, timeout: Duration) {
 // `MaybeTlsStream` exposes.
 #[allow(dead_code)]
 fn _assert_stream_traits<S: Read + Write>() {}
+
+#[cfg(test)]
+mod tests {
+    use std::net::TcpListener;
+    use std::sync::{Arc, Barrier};
+
+    use slippi_gg_api::APIClient;
+
+    use super::*;
+
+    fn test_client(url: String, tag: &str) -> MatchmakingClient {
+        let dir = std::env::temp_dir().join(format!("slippi-mm-unit-{}-{}", tag, std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let api = APIClient::new("3.7.0");
+        let user_manager = UserManager::new(api, dir, "3.7.0".into());
+        user_manager.set(|user| {
+            user.uid = "default-uid".to_string();
+            user.play_key = "default-key".to_string();
+            user.connect_code = "DEF#1".to_string();
+            user.display_name = "Default".to_string();
+        });
+        MatchmakingClient::with_url(user_manager, "3.7.0".into(), url)
+    }
+
+    fn wait_state(client: &MatchmakingClient, session_id: u64, target: MatchmakingState, timeout: Duration) -> MatchmakingState {
+        let start = Instant::now();
+        loop {
+            let state = client.state_for(session_id);
+            if state == target || state == MatchmakingState::Failed || start.elapsed() > timeout {
+                return state;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn four_concurrent_sessions_with_overrides() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://{}/v1/queue", addr);
+
+        let barrier = Arc::new(Barrier::new(4));
+        let server = thread::spawn({
+            let barrier = barrier.clone();
+            move || {
+                let mut workers = Vec::new();
+                for _ in 0..4 {
+                    let (stream, _) = listener.accept().unwrap();
+                    let barrier = barrier.clone();
+                    workers.push(thread::spawn(move || {
+                        let mut ws = tungstenite::accept(stream).unwrap();
+                        let join_msg = ws.read().unwrap().into_text().unwrap();
+                        let join: serde_json::Value = serde_json::from_str(join_msg.as_str()).unwrap();
+                        let port = join["port"].as_u64().unwrap();
+                        let uid = join["user"]["uid"].as_str().unwrap().to_string();
+                        ws.send(Message::text(
+                            serde_json::json!({
+                                "type": "joined",
+                                "ticketId": format!("ticket-{}", port),
+                                "token": format!("token-{}", port),
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap();
+
+                        // All four sessions must join concurrently before any receives a match.
+                        barrier.wait();
+
+                        ws.send(Message::text(
+                            serde_json::json!({
+                                "type": "match",
+                                "matchId": format!("mode.teams-concurrent-{}", uid),
+                                "isHost": port == 49000,
+                                "port": port,
+                                "uid": uid,
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap();
+                        let _ = ws.close(None);
+                    }));
+                }
+                for w in workers {
+                    w.join().unwrap();
+                }
+            }
+        });
+
+        let client = test_client(url, "four-concurrent");
+        let mut sessions = Vec::new();
+        for i in 0..4u16 {
+            let id = client.start_concurrent(MatchRequest {
+                mode: 3,
+                connect_code: b"TEST".to_vec(),
+                netplay_port: 49000 + i,
+                lan_addr: format!("192.168.0.10:{}", 49000 + i),
+                user_override: Some(protocol::UserInfo {
+                    uid: format!("uid-{}", i),
+                    play_key: format!("key-{}", i),
+                    connect_code: format!("P{}#1", i + 1),
+                    display_name: format!("Player {}", i + 1),
+                }),
+                ..Default::default()
+            });
+            sessions.push(id);
+        }
+
+        for (i, &id) in sessions.iter().enumerate() {
+            assert_eq!(
+                wait_state(&client, id, MatchmakingState::Matched, Duration::from_secs(5)),
+                MatchmakingState::Matched,
+                "session {} error: {}",
+                id,
+                client.error_message_for(id)
+            );
+            let raw = client.take_result_json_for(id).expect("expected result json");
+            let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(parsed["port"], 49000 + i as u64);
+            assert_eq!(parsed["uid"], format!("uid-{}", i));
+            assert_eq!(parsed["matchId"], format!("mode.teams-concurrent-uid-{}", i));
+            assert!(client.take_result_json_for(id).is_none());
+        }
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn cancel_one_session_keeps_other_alive() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://{}/v1/queue", addr);
+
+        let (tx_cancelled, rx_cancelled) = std::sync::mpsc::channel();
+        let (tx_match2, rx_match2) = std::sync::mpsc::channel::<()>();
+        let rx_match2 = Arc::new(Mutex::new(Some(rx_match2)));
+
+        let server = thread::spawn(move || {
+            let mut workers = Vec::new();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+                let tx_cancelled = tx_cancelled.clone();
+                let rx_match2 = rx_match2.clone();
+                workers.push(thread::spawn(move || {
+                    let mut ws = tungstenite::accept(stream).unwrap();
+                    let join_msg = ws.read().unwrap().into_text().unwrap();
+                    let join: serde_json::Value = serde_json::from_str(join_msg.as_str()).unwrap();
+                    let port = join["port"].as_u64().unwrap();
+                    ws.send(Message::text(
+                        serde_json::json!({
+                            "type": "joined",
+                            "ticketId": format!("ticket-{}", port),
+                            "token": format!("token-{}", port),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap();
+
+                    if port == 49000 {
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        loop {
+                            assert!(Instant::now() < deadline, "timed out waiting for cancel on session 1");
+                            match ws.read() {
+                                Ok(Message::Text(txt)) => {
+                                    let msg: serde_json::Value = serde_json::from_str(txt.as_str()).unwrap();
+                                    if msg["type"] == "cancel" {
+                                        tx_cancelled.send(port).unwrap();
+                                        let _ = ws.close(None);
+                                        return;
+                                    }
+                                },
+                                Ok(Message::Close(_)) => {
+                                    tx_cancelled.send(port).unwrap();
+                                    return;
+                                },
+                                Err(tungstenite::Error::Io(e)) if is_timeout(&e) => continue,
+                                Ok(_) => continue,
+                                Err(err) => panic!("unexpected ws read error: {}", err),
+                            }
+                        }
+                    } else {
+                        let rx = rx_match2.lock().unwrap().take().unwrap();
+                        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        ws.send(Message::text(
+                            serde_json::json!({
+                                "type": "match",
+                                "matchId": "mode.teams-survivor",
+                                "isHost": true,
+                                "port": port,
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap();
+                        let _ = ws.close(None);
+                    }
+                }));
+            }
+            for w in workers {
+                w.join().unwrap();
+            }
+        });
+
+        let client = test_client(url, "cancel-one");
+        let id1 = client.start_concurrent(MatchRequest {
+            mode: 3,
+            connect_code: b"TEST".to_vec(),
+            netplay_port: 49000,
+            ..Default::default()
+        });
+        let id2 = client.start_concurrent(MatchRequest {
+            mode: 3,
+            connect_code: b"TEST".to_vec(),
+            netplay_port: 49001,
+            ..Default::default()
+        });
+
+        assert_eq!(wait_state(&client, id1, MatchmakingState::Queued, Duration::from_secs(5)), MatchmakingState::Queued);
+        assert_eq!(wait_state(&client, id2, MatchmakingState::Queued, Duration::from_secs(5)), MatchmakingState::Queued);
+
+        client.cancel_session(id1);
+        assert_eq!(client.state_for(id1), MatchmakingState::Idle);
+        assert_eq!(rx_cancelled.recv_timeout(Duration::from_secs(5)).unwrap(), 49000);
+        assert_eq!(client.state_for(id2), MatchmakingState::Queued);
+
+        tx_match2.send(()).unwrap();
+        assert_eq!(wait_state(&client, id2, MatchmakingState::Matched, Duration::from_secs(5)), MatchmakingState::Matched);
+        let raw = client.take_result_json_for(id2).expect("survivor should get match json");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["matchId"], "mode.teams-survivor");
+        assert_eq!(parsed["port"], 49001);
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn error_on_one_session_keeps_other_alive() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://{}/v1/queue", addr);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let server = thread::spawn(move || {
+            let mut workers = Vec::new();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let barrier = barrier.clone();
+                workers.push(thread::spawn(move || {
+                    let mut ws = tungstenite::accept(stream).unwrap();
+                    let join_msg = ws.read().unwrap().into_text().unwrap();
+                    let join: serde_json::Value = serde_json::from_str(join_msg.as_str()).unwrap();
+                    let port = join["port"].as_u64().unwrap();
+                    ws.send(Message::text(
+                        serde_json::json!({
+                            "type": "joined",
+                            "ticketId": format!("ticket-{}", port),
+                            "token": format!("token-{}", port),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap();
+                    barrier.wait();
+
+                    if port == 49000 {
+                        ws.send(Message::text(
+                            serde_json::json!({
+                                "type": "error",
+                                "error": "boom 1",
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap();
+                    } else {
+                        ws.send(Message::text(
+                            serde_json::json!({
+                                "type": "match",
+                                "matchId": "mode.teams-session-2",
+                                "isHost": false,
+                                "port": port,
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap();
+                    }
+                    let _ = ws.close(None);
+                }));
+            }
+            for w in workers {
+                w.join().unwrap();
+            }
+        });
+
+        let client = test_client(url, "error-one");
+        let id1 = client.start_concurrent(MatchRequest {
+            mode: 3,
+            connect_code: b"TEST".to_vec(),
+            netplay_port: 49000,
+            ..Default::default()
+        });
+        let id2 = client.start_concurrent(MatchRequest {
+            mode: 3,
+            connect_code: b"TEST".to_vec(),
+            netplay_port: 49001,
+            ..Default::default()
+        });
+
+        assert_eq!(wait_state(&client, id1, MatchmakingState::Failed, Duration::from_secs(5)), MatchmakingState::Failed);
+        assert_eq!(client.error_message_for(id1), "boom 1");
+        assert!(client.take_result_json_for(id1).is_none());
+
+        assert_eq!(wait_state(&client, id2, MatchmakingState::Matched, Duration::from_secs(5)), MatchmakingState::Matched);
+        let raw = client.take_result_json_for(id2).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["matchId"], "mode.teams-session-2");
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn non_concurrent_start_cancels_existing() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://{}/v1/queue", addr);
+
+        let (tx_cancelled, rx_cancelled) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut workers = Vec::new();
+            for idx in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+                let tx_cancelled = tx_cancelled.clone();
+                workers.push(thread::spawn(move || {
+                    let mut ws = tungstenite::accept(stream).unwrap();
+                    let join_msg = ws.read().unwrap().into_text().unwrap();
+                    let join: serde_json::Value = serde_json::from_str(join_msg.as_str()).unwrap();
+                    let port = join["port"].as_u64().unwrap();
+                    ws.send(Message::text(
+                        serde_json::json!({
+                            "type": "joined",
+                            "ticketId": format!("ticket-{}", idx),
+                            "token": format!("token-{}", idx),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap();
+
+                    if port == 41000 {
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        loop {
+                            assert!(Instant::now() < deadline, "session 1 was not cancelled");
+                            match ws.read() {
+                                Ok(Message::Text(txt)) => {
+                                    let msg: serde_json::Value = serde_json::from_str(txt.as_str()).unwrap();
+                                    if msg["type"] == "cancel" {
+                                        tx_cancelled.send(()).unwrap();
+                                        let _ = ws.close(None);
+                                        return;
+                                    }
+                                },
+                                Ok(Message::Close(_)) => {
+                                    tx_cancelled.send(()).unwrap();
+                                    return;
+                                },
+                                Err(tungstenite::Error::Io(e)) if is_timeout(&e) => continue,
+                                Ok(_) => continue,
+                                Err(err) => panic!("unexpected ws read error: {}", err),
+                            }
+                        }
+                    } else {
+                        ws.send(Message::text(
+                            serde_json::json!({
+                                "type": "match",
+                                "matchId": "mode.unranked-second",
+                                "isHost": true,
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap();
+                        let _ = ws.close(None);
+                    }
+                }));
+            }
+            for w in workers {
+                w.join().unwrap();
+            }
+        });
+
+        let client = test_client(url, "non-concurrent");
+        let id1 = client.start(MatchRequest {
+            mode: 1,
+            netplay_port: 41000,
+            ..Default::default()
+        });
+        assert_eq!(wait_state(&client, id1, MatchmakingState::Queued, Duration::from_secs(5)), MatchmakingState::Queued);
+
+        let id2 = client.start(MatchRequest {
+            mode: 1,
+            netplay_port: 41001,
+            ..Default::default()
+        });
+        assert_eq!(client.state_for(id1), MatchmakingState::Idle);
+        rx_cancelled.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        assert_eq!(wait_state(&client, id2, MatchmakingState::Matched, Duration::from_secs(5)), MatchmakingState::Matched);
+        let raw = client.take_result_json_for(id2).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["matchId"], "mode.unranked-second");
+
+        server.join().unwrap();
+    }
+}

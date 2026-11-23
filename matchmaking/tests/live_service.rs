@@ -61,6 +61,7 @@ fn two_clients_get_matched() {
             netplay_port: port,
             lan_addr: format!("192.168.1.2:{}", port),
             stun: [Some(reflexive); 2],
+            user_override: None,
             debug: Some(DebugOverrides {
                 latitude: Some(lat),
                 longitude: Some(lon),

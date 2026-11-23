@@ -12,5 +12,5 @@ mod protocol;
 mod stun;
 
 pub use client::{MatchRequest, MatchmakingClient, MatchmakingState, URL_ENV_VAR};
-pub use protocol::{Candidate, DebugOverrides};
+pub use protocol::{Candidate, DebugOverrides, UserInfo};
 pub use stun::{NatType, REQUEST_LEN, build_binding_request, classify_nat, parse_binding_response};

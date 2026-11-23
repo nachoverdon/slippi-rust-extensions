@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The identity the client claims. The service verifies it.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct UserInfo {
     pub uid: String,
     #[serde(rename = "playKey")]
